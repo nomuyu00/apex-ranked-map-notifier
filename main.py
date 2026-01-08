@@ -22,11 +22,27 @@ JA_MAP = {
 USER_AGENT = "Mozilla/5.0 (compatible; ApexRankMapDiscordNotifier/1.0; +https://github.com/)"
 
 
+ALS_ALL_MODES_URL = "https://apexlegendsstatus.com/current-map"  # ← これを定数エリアに追加してOK
+
+def _normalize_lines(html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n")
+
+    lines: list[str] = []
+    for ln in text.splitlines():
+        # NBSPなど「見た目同じ空白」を普通の空白へ
+        ln = ln.replace("\xa0", " ").replace("\u202f", " ").strip()
+        if ln:
+            lines.append(ln)
+    return lines
+
+
 def fetch_ranked_rotation():
     """
-    ApexLegendsStatusのランクマップローテページを取得し、
-    先頭(現在)と次(次のマップ)を抽出します。
+    1) ranked専用ページから抽出（一覧の先頭＝現在、2番目＝次）
+    2) 取れない場合は /current-map の BR Ranked セクションから抽出（保険）
     """
+    # --- (1) ranked専用ページ ---
     r = requests.get(
         ALS_RANKED_URL,
         timeout=25,
@@ -34,34 +50,53 @@ def fetch_ranked_rotation():
     )
     r.raise_for_status()
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    text = soup.get_text("\n")
-
-    lines = [ln.strip() for ln in text.splitlines()]
-    lines = [ln for ln in lines if ln]
+    lines = _normalize_lines(r.text)
 
     entries = []
     for i, ln in enumerate(lines):
-        if ln.startswith("From "):
-            if i == 0:
-                continue
+        if i == 0:
+            continue
+
+        # ★ここが修正点： "From " ではなく "from" で始まるか（スペース不要）
+        if ln.lower().startswith("from"):
             name = lines[i - 1].strip()
-            name = re.sub(r"^#+\s*", "", name).strip()  # 念のため "### " を除去
-
-            # 変な見出しを除外（保険）
-            if len(name) > 60:
-                continue
-            if name.lower().startswith("from"):
-                continue
-
+            name = re.sub(r"^#+\s*", "", name).strip()  # 念のため
             entries.append({"name": name, "detail": ln})
 
-    if not entries:
-        raise RuntimeError("マップ情報を抽出できませんでした（ページ構造が変わった可能性）")
+    if entries:
+        current = entries[0]
+        next_map = entries[1] if len(entries) >= 2 else None
+        return current, next_map
 
-    current = entries[0]
-    next_map = entries[1] if len(entries) >= 2 else None
-    return current, next_map
+    # --- (2) 保険：/current-map の BR Ranked から拾う ---
+    r = requests.get(
+        ALS_ALL_MODES_URL,
+        timeout=25,
+        headers={"User-Agent": USER_AGENT},
+    )
+    r.raise_for_status()
+    lines = _normalize_lines(r.text)
+
+    idx = next((i for i, l in enumerate(lines) if l.lower() == "br ranked"), None)
+    if idx is None or idx + 1 >= len(lines):
+        sample = "\n".join(lines[:80])
+        raise RuntimeError("BR Ranked セクションが見つかりませんでした。\n---DEBUG---\n" + sample)
+
+    current_name = lines[idx + 1]
+    current_from = next((l for l in lines[idx + 2 : idx + 20] if l.lower().startswith("from")), "")
+
+    next_line = next((l for l in lines[idx + 2 : idx + 30] if "next map is" in l.lower()), "")
+    m = re.search(r"next map is\s+(.*?),\s*from\s+(.*)$", next_line, re.I)
+
+    if not (current_from and m):
+        sample = "\n".join(lines[idx : idx + 50])
+        raise RuntimeError("BR Ranked の抽出に失敗しました。\n---DEBUG---\n" + sample)
+
+    next_name = m.group(1).strip()
+    next_detail = "From " + m.group(2).strip()
+
+    return {"name": current_name, "detail": current_from}, {"name": next_name, "detail": next_detail}
+
 
 
 def _slug_candidates(map_name: str):
@@ -88,21 +123,12 @@ def _slug_candidates(map_name: str):
 
 
 def find_map_image_url(map_name: str):
-    """
-    ALSの /assets/maps/ にある画像URLを推測して実在確認し、見つかったURLを返す。
-    見つからなければ None。
-    """
-    for slug in _slug_candidates(map_name):
-        url = f"{ALS_ASSET_BASE}{slug}.png"
-        try:
-            rr = requests.get(url, timeout=15, stream=True, headers={"User-Agent": USER_AGENT})
-            if rr.status_code == 200 and rr.headers.get("Content-Type", "").startswith("image"):
-                rr.close()
-                return url
-            rr.close()
-        except Exception:
-            continue
-    return None
+    cands = _slug_candidates(map_name)
+    if not cands:
+        return None
+    # 先頭候補をそのまま使う（Discordが取得して表示する）
+    return f"{ALS_ASSET_BASE}{cands[0]}.png"
+
 
 
 def post_to_discord(webhook_url: str, current: dict, next_map: dict | None, image_url: str | None):
